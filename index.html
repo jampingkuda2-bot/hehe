@@ -172,14 +172,14 @@ function textPoints(n, str) {
 
 function heartWithTextPoints(n, lines) {
   const off = document.createElement('canvas');
-  off.width = 700; off.height = 700;
+  off.width = 900; off.height = 900;
   const octx = off.getContext('2d');
   octx.strokeStyle = '#fff';
   octx.fillStyle = '#fff';
-  octx.lineWidth = 12;
+  octx.lineWidth = 16;
 
   // garis luar bentuk hati (outline, bukan penuh, biar tulisan di dalam kebaca)
-  const cx = 350, cy = 190, size = 380;
+  const cx = 450, cy = 220, size = 480;
   const topH = size * 0.3;
   octx.beginPath();
   octx.moveTo(cx, cy + topH);
@@ -190,11 +190,11 @@ function heartWithTextPoints(n, lines) {
   octx.closePath();
   octx.stroke();
 
-  // tulisan di bagian "perut" hati yang paling lebar, biar gak numpuk/kepotong
-  octx.font = "bold 40px 'Courier New', monospace";
+  // tulisan di bagian "perut" hati yang paling lebar, dibesarin biar jelas kebaca
+  octx.font = "bold 58px 'Courier New', monospace";
   octx.textAlign = 'center';
   octx.textBaseline = 'middle';
-  const lineY = [cy + topH + 55, cy + topH + 113];
+  const lineY = [cy + topH + 65, cy + topH + 138];
   lines.forEach((line, idx) => {
     octx.fillText(line, cx, lineY[idx]);
   });
