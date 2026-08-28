@@ -79,7 +79,7 @@
   <div id="hint">
     ✋ Telapak terbuka → partikel bebas<br>
     ✊ Kepalan tangan → bentuk hati<br>
-    🤟 Sign "I Love You" → tulisan<br>
+    🤟 Sign "I Love You" → hati + tulisan "angel"<br>
     ✌️ Peace → bintang<br>
     👍 Jempol → tulisan "mantap"<br>
     ☝️ Telunjuk → spiral
@@ -110,7 +110,7 @@ window.addEventListener('resize', resize);
 const GESTURES = {
   SCATTER:    { label: 'OPEN PALM', color: [79, 216, 196] },    // teal
   HEART:      { label: 'FIST · HEART', color: [255, 70, 70] },  // red
-  TEXT:       { label: 'I LOVE YOU', color: [90, 240, 170] },   // green-teal
+  TEXT:       { label: 'I LOVE YOU ANGEL', color: [255, 110, 150] }, // pink
   STAR:       { label: 'PEACE · BINTANG', color: [255, 210, 90] },  // gold
   THUMBS_UP:  { label: 'JEMPOL · MANTAP', color: [255, 150, 70] },  // orange
   POINT:      { label: 'TUNJUK · SPIRAL', color: [120, 160, 255] }, // blue
@@ -157,6 +157,56 @@ function textPoints(n, str) {
         candidates.push({
           x: (x / off.width - 0.5) * 2.6,
           y: (y / off.height - 0.5) * 0.75,
+        });
+      }
+    }
+  }
+  const pts = [];
+  for (let i = 0; i < n; i++) {
+    pts.push(candidates.length
+      ? candidates[Math.floor(Math.random() * candidates.length)]
+      : { x: 0, y: 0 });
+  }
+  return pts;
+}
+
+function heartWithTextPoints(n, lines) {
+  const off = document.createElement('canvas');
+  off.width = 700; off.height = 700;
+  const octx = off.getContext('2d');
+  octx.strokeStyle = '#fff';
+  octx.fillStyle = '#fff';
+  octx.lineWidth = 12;
+
+  // garis luar bentuk hati (outline, bukan penuh, biar tulisan di dalam kebaca)
+  const cx = 350, cy = 190, size = 380;
+  const topH = size * 0.3;
+  octx.beginPath();
+  octx.moveTo(cx, cy + topH);
+  octx.bezierCurveTo(cx, cy, cx - size / 2, cy, cx - size / 2, cy + topH);
+  octx.bezierCurveTo(cx - size / 2, cy + (size + topH) / 2, cx, cy + (size + topH) / 2, cx, cy + size);
+  octx.bezierCurveTo(cx, cy + (size + topH) / 2, cx + size / 2, cy + (size + topH) / 2, cx + size / 2, cy + topH);
+  octx.bezierCurveTo(cx + size / 2, cy, cx, cy, cx, cy + topH);
+  octx.closePath();
+  octx.stroke();
+
+  // tulisan di tengah bentuk hati
+  octx.font = "bold 54px 'Courier New', monospace";
+  octx.textAlign = 'center';
+  octx.textBaseline = 'middle';
+  lines.forEach((line, idx) => {
+    octx.fillText(line, cx, cy + topH + 95 + idx * 62);
+  });
+
+  const data = octx.getImageData(0, 0, off.width, off.height).data;
+  const candidates = [];
+  for (let y = 0; y < off.height; y += 3) {
+    for (let x = 0; x < off.width; x += 3) {
+      const a = data[(y * off.width + x) * 4 + 3];
+      if (a > 128) {
+        candidates.push({
+          x: (x / off.width - 0.5) * 2.4,
+          y: (y / off.height - 0.5) * 2.4,
         });
       }
     }
@@ -226,7 +276,7 @@ const N = 1800;
 const shapeCache = {
   SCATTER: scatterPoints(N),
   HEART: heartPoints(N),
-  TEXT: textPoints(N, 'I LOVE YOU'),
+  TEXT: heartWithTextPoints(N, ['I LOVE YOU', 'ANGEL']),
   STAR: starPoints(N),
   THUMBS_UP: textPoints(N, 'MANTAP!'),
   POINT: spiralPoints(N),
@@ -321,8 +371,20 @@ function fingerExtended(landmarks, tip, pip) {
   return dist(wrist, landmarks[tip]) > dist(wrist, landmarks[pip]) * 1.08;
 }
 
+function thumbExtended(landmarks) {
+  // Jempol punya rentang gerak beda dari 4 jari lain (nekuk melintang, bukan ke arah
+  // pergelangan), jadi diukur dari jarak ujung jempol ke pangkal telunjuk,
+  // dinormalisasi pakai ukuran telapak tangan biar konsisten di berbagai jarak kamera.
+  const tip = landmarks[4];
+  const indexMcp = landmarks[5];
+  const wrist = landmarks[0];
+  const middleMcp = landmarks[9];
+  const palmSize = dist(wrist, middleMcp) || 1;
+  return dist(tip, indexMcp) / palmSize > 0.55;
+}
+
 function detectGesture(landmarks) {
-  const thumb = fingerExtended(landmarks, 4, 2);
+  const thumb = thumbExtended(landmarks);
   const index = fingerExtended(landmarks, 8, 6);
   const middle = fingerExtended(landmarks, 12, 10);
   const ring = fingerExtended(landmarks, 16, 14);
