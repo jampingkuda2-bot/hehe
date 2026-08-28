@@ -1,61 +1,53 @@
--- Fish It Utility Module - Safe Execution
+-- Fish It Hub - With UI
+local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+
 local Players = game:GetService("Players")
+local Player = Players.LocalPlayer
 local HttpService = game:GetService("HttpService")
 local Workspace = game:GetService("Workspace")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualUser = game:GetService("VirtualUser")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Config = {
-    WebhookURL = "",
-    DiscordEnabled = true,
-    WeatherNotify = true,
-    AutoFish = false,
-    AntiAFK = true,
-    MinDelay = 0.8,
-    MaxDelay = 1.5,
-    WeatherCheckInterval = 5,
+local Window = Fluent:CreateWindow({
+    Title = "Fish It Hub",
+    SubTitle = "Weather Detector",
+    TabWidth = 160,
+    Size = UDim2.fromOffset(500, 400),
+    Acrylic = true,
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.RightShift
+})
+
+local Tabs = {
+    Main = Window:AddTab({ Title = "Main", Icon = "fish" }),
+    Weather = Window:AddTab({ Title = "Weather", Icon = "cloud" }),
+    Discord = Window:AddTab({ Title = "Discord", Icon = "message-square" })
 }
 
-local function randomizedDelay()
-    local delayTime = Config.MinDelay + (math.random() * (Config.MaxDelay - Config.MinDelay))
-    task.wait(delayTime)
-end
+local Settings = {
+    Webhook = "",
+    DiscordEnabled = true,
+    AutoFish = false,
+    AntiAFK = true,
+    NotifyElemental = true
+}
 
-local function safeFireRemote(remoteName, ...)
-    local success = pcall(function()
-        local remote = ReplicatedStorage:FindFirstChild(remoteName)
-        if remote and remote:IsA("RemoteEvent") then
-            remote:FireServer(...)
-        end
-    end)
-    return success
-end
+local lastElemental = ""
 
-local function sendDiscord(message)
-    if not Config.DiscordEnabled or Config.WebhookURL == "" then return end
+-- Discord
+local function sendDiscord(msg)
+    if not Settings.DiscordEnabled or Settings.Webhook == "" then return end
     pcall(function()
-        local payload = HttpService:JSONEncode({
-            content = message,
-            username = "Fish It Utility"
-        })
+        local payload = HttpService:JSONEncode({content = msg})
         if syn then
-            syn.request({
-                Url = Config.WebhookURL,
-                Method = "POST",
-                Headers = {["Content-Type"] = "application/json"},
-                Body = payload
-            })
+            syn.request({Url = Settings.Webhook, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = payload})
         else
-            request({
-                Url = Config.WebhookURL,
-                Method = "POST",
-                Headers = {["Content-Type"] = "application/json"},
-                Body = payload
-            })
+            request({Url = Settings.Webhook, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = payload})
         end
     end)
 end
 
+-- Weather
 local function getWeather()
     local weather = "Unknown"
     pcall(function()
@@ -75,69 +67,106 @@ local function checkElemental(weather)
     return nil
 end
 
-local WeatherListener = {}
-WeatherListener.lastElemental = ""
+-- Main Tab
+Tabs.Main:AddSection("Features")
 
-function WeatherListener.Start()
-    task.spawn(function()
-        while true do
-            pcall(function()
-                local weather = getWeather()
-                local etype = checkElemental(weather)
+Tabs.Main:AddToggle("AutoFish", {
+    Title = "Auto Fish",
+    Default = false,
+    Callback = function(v) Settings.AutoFish = v end
+})
 
-                if etype and etype ~= WeatherListener.lastElemental and Config.WeatherNotify then
-                    WeatherListener.lastElemental = etype
-                    local emoji = etype == "fire" and "🔥" or etype == "thunder" and "⚡" or "❄️"
-                    local msg = emoji .. " " .. etype:upper() .. " Weather Detected!"
-                    sendDiscord(msg .. "\nWeather: " .. weather)
-                end
+Tabs.Main:AddToggle("AntiAFK", {
+    Title = "Anti-AFK",
+    Default = true,
+    Callback = function(v) Settings.AntiAFK = v end
+})
 
-                WeatherListener.lastElemental = etype or ""
-            end)
-            task.wait(Config.WeatherCheckInterval)
-        end
-    end)
-end
+Tabs.Main:AddParagraph({
+    Title = "Current Weather",
+    Value = "Loading..."
+})
 
-local FishingLogic = {}
+-- Weather Tab
+Tabs.Weather:AddSection("Elemental Monitor")
 
-function FishingLogic.Start()
-    task.spawn(function()
-        while true do
-            if Config.AutoFish then
-                pcall(function()
-                    safeFireRemote("CastLine")
-                    randomizedDelay()
-                    safeFireRemote("Fish")
-                    randomizedDelay()
-                end)
+Tabs.Weather:AddToggle("NotifyElemental", {
+    Title = "Notify Elemental Weather",
+    Default = true,
+    Callback = function(v) Settings.NotifyElemental = v end
+})
+
+-- Discord Tab
+Tabs.Discord:AddSection("Webhook")
+
+Tabs.Discord:AddToggle("DiscordEnabled", {
+    Title = "Discord Notifications",
+    Default = true,
+    Callback = function(v) Settings.DiscordEnabled = v end
+})
+
+Tabs.Discord:AddInput("Webhook", {
+    Title = "Webhook URL",
+    Default = "",
+    Numeric = false,
+    Finished = false,
+    Callback = function(v)
+        if v ~= "" then Settings.Webhook = v end
+    end
+})
+
+-- Main Loop
+task.spawn(function()
+    while true do
+        pcall(function()
+            local weather = getWeather()
+            local etype = checkElemental(weather)
+            
+            if etype and etype ~= lastElemental and Settings.NotifyElemental then
+                lastElemental = etype
+                local emoji = etype == "fire" and "🔥" or etype == "thunder" and "⚡" or "❄️"
+                local msg = emoji .. " " .. etype:upper() .. " Weather!"
+                sendDiscord(msg)
+                Fluent:Notify({
+                    Title = msg,
+                    Content = weather,
+                    Duration = 5
+                })
             end
-            randomizedDelay()
-        end
-    end)
-end
+            
+            lastElemental = etype or ""
+            
+            if Settings.AutoFish then
+                pcall(function()
+                    local event = ReplicatedStorage:FindFirstChild("CastLine") or ReplicatedStorage:FindFirstChild("Cast")
+                    if event and event:IsA("RemoteEvent") then
+                        event:FireServer()
+                    end
+                end)
+                wait(math.random(8, 15) / 10)
+            end
+        end)
+        wait(5)
+    end
+end)
 
-local AntiAFK = {}
-
-function AntiAFK.Start()
-    if not Config.AntiAFK then return end
-
+-- Anti-AFK
+if Settings.AntiAFK then
     task.spawn(function()
-        while true do
+        while Settings.AntiAFK do
             pcall(function()
                 VirtualUser:Button2Down(Vector2.new(0,0), Workspace.CurrentCamera.CFrame)
-                task.wait(0.5)
+                wait(1)
                 VirtualUser:Button2Up(Vector2.new(0,0), Workspace.CurrentCamera.CFrame)
             end)
-            task.wait(240)
+            wait(240)
         end
     end)
 end
 
-local function Init()
-    WeatherListener.Start()
-    FishingLogic.Start()
-    AntiAFK.Start()
-end
-
-Init()
+-- Notify loaded
+Fluent:Notify({
+    Title = "Fish It Hub",
+    Content = "Script loaded successfully!",
+    Duration = 5
+})
