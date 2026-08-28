@@ -1,293 +1,549 @@
--- Fish It Hub
-local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
-local SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
-local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
+--[[
+	═══════════════════════════════════════════════════════════════
+	AsyncWorkspaceMonitor — Single LocalScript (Client-Side Only)
+	═══════════════════════════════════════════════════════════════
+	
+	Penempatan : StarterPlayerScripts / StarterGui (LocalScript)
+	Engine     : Roblox Luau (strict mode)
+	Arsitektur : Self-contained, zero external dependency
+	
+	Fitur:
+	  ✓ Monitoring Workspace secara asinkron via task.spawn
+	  ✓ Jeda acak (jitter) per iterasi — natural pacing
+	  ✓ Error handling berlapis dengan pcall
+	  ✓ Circuit breaker untuk mencegah infinite error loop
+	  ✓ Delta detection (objek bertambah / berkurang)
+	  ✓ Listener system dengan unsubscribe
+	  ✓ Graceful shutdown & cleanup
+	  ✓ Debug logging dengan toggle
+	
+	═══════════════════════════════════════════════════════════════
+]]
 
-local Players = game:GetService("Players")
-local Player = Players.LocalPlayer
-local Workspace = game:GetService("Workspace")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local HttpService = game:GetService("HttpService")
-local VirtualUser = game:GetService("VirtualUser")
+--!strict
 
-local Window = Fluent:CreateWindow({
-    Title = "Fish It Hub",
-    SubTitle = "v1.0",
-    TabWidth = 160,
-    Size = UDim2.fromOffset(550, 550),
-    Acrylic = true,
-    Theme = "Dark",
-    MinimizeKey = Enum.KeyCode.RightShift
-})
+-- ╔══════════════════════════════════════════╗
+-- ║          SERVICES & REFERENCES           ║
+-- ╚══════════════════════════════════════════╝
 
-local Tabs = {
-    Main = Window:AddTab({ Title = "Main", Icon = "fish" }),
-    Weather = Window:AddTab({ Title = "Weather", Icon = "cloud" }),
-    Discord = Window:AddTab({ Title = "Discord", Icon = "message-square" }),
-    Settings = Window:AddTab({ Title = "Settings", Icon = "settings" })
+local Workspace   = game:GetService("Workspace")
+local RunService  = game:GetService("RunService")
+
+-- Sanity check: pastikan ini berjalan di client
+if not RunService:IsClient() then
+	warn("[AsyncWorkspaceMonitor] Script ini HANYA untuk client (LocalScript).")
+	return
+end
+
+-- ╔══════════════════════════════════════════╗
+-- ║          TYPE DEFINITIONS                ║
+-- ╚══════════════════════════════════════════╝
+
+type MonitorConfig = {
+	MinInterval:     number,   -- Jeda minimum per iterasi (detik)
+	MaxInterval:     number,   -- Jeda maksimum per iterasi (detik)
+	MaxRetryOnFail:  number,   -- Batas error berturut sebelum circuit break
+	VerboseLogging:  boolean,  -- Toggle debug log
+	TrackModels:     boolean,  -- Pantau Instance bertipe Model
+	TrackParts:      boolean,  -- Pantau Instance bertipe BasePart
+	TrackFolders:    boolean,  -- Pantau Instance bertipe Folder
 }
 
--- Settings
-getgenv().Webhook = ""
-getgenv().DiscordEnabled = true
-getgenv().AutoFish = false
-getgenv().AutoSell = false
-getgenv().AutoEquip = false
-getgenv().AntiAFK = true
-getgenv().NotifyElemental = true
-getgenv().NotifyNormal = false
-getgenv().CheckInterval = 5
-getgenv().lastWeather = ""
-getgenv().lastElemental = ""
+type WorkspaceSnapshot = {
+	Timestamp:      number,
+	ChildCount:     number,
+	ActiveChildren: { [string]: boolean },
+	DeltaAdded:     { string },
+	DeltaRemoved:   { string },
+}
 
--- Discord Function
-local function sendDiscord(title, desc, color)
-    if not getgenv().DiscordEnabled or getgenv().Webhook == "" then return end
-    pcall(function()
-        local payload = HttpService:JSONEncode({
-            embeds = {{
-                title = title,
-                description = desc,
-                color = color or 5814783,
-                footer = {text = "Fish It Hub • " .. os.date("%H:%M:%S")}
-            }}
-        })
-        if syn then
-            syn.request({Url = getgenv().Webhook, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = payload})
-        else
-            request({Url = getgenv().Webhook, Method = "POST", Headers = {["Content-Type"] = "application/json"}, Body = payload})
-        end
-    end)
+type MonitorState = "Idle" | "Running" | "Stopped" | "Error"
+
+-- ╔══════════════════════════════════════════╗
+-- ║          CONFIGURATION                   ║
+-- ╚══════════════════════════════════════════╝
+
+local CONFIG: MonitorConfig = {
+	MinInterval     = 0.8,
+	MaxInterval     = 2.5,
+	MaxRetryOnFail  = 5,
+	VerboseLogging  = true,
+	TrackModels     = true,
+	TrackParts      = true,
+	TrackFolders    = true,
+}
+
+-- ╔══════════════════════════════════════════╗
+-- ║          INTERNAL STATE                  ║
+-- ╚══════════════════════════════════════════╝
+
+local _state:             MonitorState            = "Idle"
+local _lastSnapshot:      WorkspaceSnapshot?      = nil
+local _consecutiveErrors: number                  = 0
+local _iterationCount:    number                  = 0
+local _listeners:         { (WorkspaceSnapshot) -> () } = {}
+local _childAddedConn:    RBXScriptConnection?    = nil
+local _childRemovedConn:  RBXScriptConnection?    = nil
+local _pendingAdded:      { string }              = {}
+local _pendingRemoved:    { string }              = {}
+local _monitorThread:     thread?                 = nil
+
+-- ╔══════════════════════════════════════════╗
+-- ║          UTILITY FUNCTIONS               ║
+-- ╚══════════════════════════════════════════╝
+
+--- Logging internal dengan level & guard
+local function Log(level: string, message: string)
+	if not CONFIG.VerboseLogging and level ~= "ERROR" then
+		return
+	end
+	local timestamp = string.format("[%.3f]", os.clock())
+	local prefix = string.format("[WorkspaceMonitor]%s %s", timestamp, level)
+	if level == "ERROR" then
+		warn(prefix, message)
+	else
+		print(prefix, message)
+	end
 end
 
--- Weather Function
-local function getWeather()
-    local weather = "Unknown"
-    pcall(function()
-        local obj = Workspace:FindFirstChild("Weather") or Workspace:FindFirstChild("CurrentWeather") or Workspace:FindFirstChild("ElementalWeather") or Workspace:FindFirstChild("IslandWeather")
-        if obj and obj:IsA("StringValue") then
-            weather = obj.Value
-        end
-        
-        local ws = Workspace:FindFirstChild("WeatherSystem")
-        if ws then
-            local cw = ws:FindFirstChild("CurrentWeather")
-            if cw and cw:IsA("StringValue") then
-                weather = cw.Value
-            end
-        end
-    end)
-    return weather
+--- Generate jeda acak dalam rentang [MinInterval, MaxInterval]
+--- Dikembalikan dalam satuan detik
+local function GetRandomDelay(): number
+	local minMs = math.floor(CONFIG.MinInterval * 1000)
+	local maxMs = math.floor(CONFIG.MaxInterval * 1000)
+
+	-- Guard terhadap edge case
+	if maxMs < minMs then
+		maxMs = minMs
+	end
+
+	local jitterMs = math.random(minMs, maxMs)
+	return jitterMs / 1000
 end
 
-local function checkElemental(weather)
-    local w = weather:lower()
-    if w:find("fire") or w:find("api") or w:find("flame") or w:find("burn") or w:find("lava") then return "fire" end
-    if w:find("thunder") or w:find("petir") or w:find("lightning") or w:find("electric") or w:find("storm") then return "thunder" end
-    if w:find("ice") or w:find("es") or w:find("snow") or w:find("frost") or w:find("freeze") or w:find("cold") then return "ice" end
-    return nil
+--- Cek apakah Instance relevan untuk dipantau berdasarkan config
+local function IsTrackedInstance(instance: Instance): boolean
+	if CONFIG.TrackParts and instance:IsA("BasePart") then
+		return true
+	end
+	if CONFIG.TrackModels and instance:IsA("Model") then
+		return true
+	end
+	if CONFIG.TrackFolders and instance:IsA("Folder") then
+		return true
+	end
+	return false
 end
 
--- Main Tab
-Tabs.Main:AddSection("Fishing")
+-- ╔══════════════════════════════════════════╗
+-- ║          SNAPSHOT CAPTURE                ║
+-- ╚══════════════════════════════════════════╝
 
-Tabs.Main:AddToggle("AutoFish", {
-    Title = "Auto Fish",
-    Default = false,
-    Callback = function(v) getgenv().AutoFish = v end
-})
+--- Ambil snapshot Workspace saat ini.
+--- Dibungkus pcall agar error tidak merambat ke caller.
+local function CaptureSnapshot(): (boolean, WorkspaceSnapshot?)
+	local ok, result = pcall(function(): WorkspaceSnapshot
+		local children = Workspace:GetChildren()
+		local activeMap: { [string]: boolean } = {}
+		local count = 0
 
-Tabs.Main:AddToggle("AutoSell", {
-    Title = "Auto Sell",
-    Default = false,
-    Callback = function(v) getgenv().AutoSell = v end
-})
+		for _, child in children do
+			if IsTrackedInstance(child) then
+				-- Gunakan unique key untuk menghindari collision nama duplikat
+				local key = child:GetFullName()
+				activeMap[key] = true
+				count += 1
+			end
+		end
 
-Tabs.Main:AddToggle("AutoEquip", {
-    Title = "Auto Equip Best Rod",
-    Default = false,
-    Callback = function(v) getgenv().AutoEquip = v end
-})
+		-- Hitung delta terhadap snapshot sebelumnya
+		local added:   { string } = {}
+		local removed: { string } = {}
 
-Tabs.Main:AddParagraph({
-    Title = "Current Weather",
-    Value = "Loading..."
-})
+		if _lastSnapshot then
+			-- Objek baru: ada di snapshot sekarang, tidak ada di sebelumnya
+			for key, _ in activeMap do
+				if not _lastSnapshot.ActiveChildren[key] then
+					table.insert(added, key)
+				end
+			end
+			-- Objek hilang: ada di snapshot sebelumnya, tidak ada sekarang
+			for key, _ in _lastSnapshot.ActiveChildren do
+				if not activeMap[key] then
+					table.insert(removed, key)
+				end
+			end
+		end
 
--- Weather Tab
-Tabs.Weather:AddSection("Elemental Monitor")
+		return {
+			Timestamp      = os.clock(),
+			ChildCount     = count,
+			ActiveChildren = activeMap,
+			DeltaAdded     = added,
+			DeltaRemoved   = removed,
+		}
+	end)
 
-Tabs.Weather:AddToggle("NotifyElemental", {
-    Title = "Notify Elemental Weather",
-    Description = "Alert saat cuaca Fire/Thunder/Ice muncul",
-    Default = true,
-    Callback = function(v) getgenv().NotifyElemental = v end
-})
+	if ok then
+		return true, result :: WorkspaceSnapshot
+	else
+		return false, nil
+	end
+end
 
-Tabs.Weather:AddToggle("NotifyNormal", {
-    Title = "Notify Normal Weather",
-    Description = "Juga notifikasi cuaca normal",
-    Default = false,
-    Callback = function(v) getgenv().NotifyNormal = v end
-})
+-- ╔══════════════════════════════════════════╗
+-- ║          LISTENER SYSTEM                 ║
+-- ╚══════════════════════════════════════════╝
 
-Tabs.Weather:AddSlider("CheckInterval", {
-    Title = "Check Interval",
-    Description = "Interval cek cuaca (detik)",
-    Default = 5,
-    Min = 1,
-    Max = 30,
-    Rounding = 0,
-    Callback = function(v) getgenv().CheckInterval = v end
-})
+--- Notify semua registered listeners.
+--- Setiap callback dibungkus pcall agar satu listener error
+--- tidak menghentikan listener lainnya.
+local function NotifyListeners(snapshot: WorkspaceSnapshot)
+	if #_listeners == 0 then return end
 
-Tabs.Weather:AddButton({
-    Title = "Check Weather Now",
-    Callback = function()
-        local weather = getWeather()
-        Fluent:Notify({
-            Title = "Weather",
-            Content = weather,
-            Duration = 3
-        })
-    end
-})
+	for i, callback in _listeners do
+		local ok, err = pcall(callback, snapshot)
+		if not ok then
+			Log("ERROR", string.format(
+				"Listener #%d threw an error: %s", i, tostring(err)
+			))
+		end
+	end
+end
 
--- Discord Tab
-Tabs.Discord:AddSection("Webhook Settings")
+--- Daftarkan listener. Mengembalikan fungsi unsubscribe.
+local function OnSnapshot(callback: (WorkspaceSnapshot) -> ()): () -> ()
+	table.insert(_listeners, callback)
+	local index = #_listeners
+	Log("INFO", "Listener #" .. index .. " registered")
 
-Tabs.Discord:AddToggle("DiscordEnabled", {
-    Title = "Discord Notifications",
-    Default = true,
-    Callback = function(v) getgenv().DiscordEnabled = v end
-})
+	-- Return unsubscribe closure
+	return function()
+		for i, cb in _listeners do
+			if cb == callback then
+				table.remove(_listeners, i)
+				Log("INFO", "Listener #" .. i .. " unregistered")
+				break
+			end
+		end
+	end
+end
 
-Tabs.Discord:AddInput("Webhook", {
-    Title = "Webhook URL",
-    Default = "",
-    Numeric = false,
-    Finished = false,
-    Callback = function(v)
-        if v ~= "" then
-            getgenv().Webhook = v
-            Fluent:Notify({
-                Title = "Webhook Saved",
-                Content = "Discord webhook updated",
-                Duration = 3
-            })
-        end
-    end
-})
+-- ╔══════════════════════════════════════════╗
+-- ║          EVENT BRIDGE                    ║
+-- ╚══════════════════════════════════════════╝
+-- Menggunakan ChildAdded/ChildRemoving sebagai pelengkap
+-- delta detection di luar polling loop.
 
-Tabs.Discord:AddButton({
-    Title = "Test Webhook",
-    Callback = function()
-        sendDiscord("✅ Test Alert", "Fish It Hub is working!\n**Player:** " .. Player.Name, 65280)
-        Fluent:Notify({
-            Title = "Test Sent",
-            Content = "Check Discord",
-            Duration = 3
-        })
-    end
-})
+local function SetupEventBridge()
+	local ok1, err1 = pcall(function()
+		_childAddedConn = Workspace.ChildAdded:Connect(function(child: Instance)
+			if IsTrackedInstance(child) then
+				table.insert(_pendingAdded, child:GetFullName())
+			end
+		end)
+	end)
 
--- Save Manager
-SaveManager:SetLibrary(Fluent)
-SaveManager:IgnoreThemeSettings()
-SaveManager:SetFolder("FishItHub/")
-SaveManager:BuildConfigSection(Tabs.Settings)
+	local ok2, err2 = pcall(function()
+		_childRemovedConn = Workspace.ChildRemoving:Connect(function(child: Instance)
+			if IsTrackedInstance(child) then
+				table.insert(_pendingRemoved, child:GetFullName())
+			end
+		end)
+	end)
 
-InterfaceManager:SetLibrary(Fluent)
-InterfaceManager:BuildInterfaceSection(Tabs.Settings)
+	if not ok1 then
+		Log("ERROR", "ChildAdded bridge failed: " .. tostring(err1))
+	end
+	if not ok2 then
+		Log("ERROR", "ChildRemoving bridge failed: " .. tostring(err2))
+	end
+end
 
--- Auto Fish Loop
-task.spawn(function()
-    while true do
-        pcall(function()
-            if getgenv().AutoFish then
-                local event = ReplicatedStorage:FindFirstChild("CastLine") or ReplicatedStorage:FindFirstChild("Cast") or ReplicatedStorage:FindFirstChild("Fish")
-                if event and event:IsA("RemoteEvent") then
-                    event:FireServer()
-                end
-            end
-            
-            if getgenv().AutoSell then
-                local sell = ReplicatedStorage:FindFirstChild("Sell") or ReplicatedStorage:FindFirstChild("SellFish")
-                if sell and sell:IsA("RemoteEvent") then
-                    sell:FireServer()
-                end
-            end
-            
-            if getgenv().AutoEquip then
-                pcall(function()
-                    local bestRod = nil
-                    local bestPower = 0
-                    for _, item in pairs(Player.Backpack:GetChildren()) do
-                        if item:IsA("Tool") and item.Name:lower():find("rod") then
-                            local power = item:GetAttribute("Power") or 0
-                            if power > bestPower then
-                                bestPower = power
-                                bestRod = item
-                            end
-                        end
-                    end
-                    if bestRod then
-                        Player.Character.Humanoid:EquipTool(bestRod)
-                    end
-                end)
-            end
-        end)
-        wait(2)
-    end
+local function TeardownEventBridge()
+	if _childAddedConn then
+		_childAddedConn:Disconnect()
+		_childAddedConn = nil
+	end
+	if _childRemovedConn then
+		_childRemovedConn:Disconnect()
+		_childRemovedConn = nil
+	end
+	_pendingAdded   = {}
+	_pendingRemoved = {}
+end
+
+-- ╔══════════════════════════════════════════╗
+-- ║          CORE MONITOR LOOP               ║
+-- ╚══════════════════════════════════════════╝
+-- Loop utama yang berjalan di dalam task.spawn.
+-- Setiap iterasi:
+--   1. task.wait(GetRandomDelay())  → jitter acak
+--   2. CaptureSnapshot()            → pcall-wrapped
+--   3. Proses delta & notify
+--   4. Circuit breaker check
+
+local function MonitorLoop()
+	Log("INFO", "═══ Monitor loop STARTED ═══")
+	Log("INFO", string.format(
+		"Config → Interval: [%.1fs ~ %.1fs] | MaxRetry: %d",
+		CONFIG.MinInterval, CONFIG.MaxInterval, CONFIG.MaxRetryOnFail
+	))
+
+	while _state == "Running" do
+		-- ── Jeda acak SEBELUM eksekusi (natural pacing) ──
+		local delay = GetRandomDelay()
+		_iterationCount += 1
+
+		if CONFIG.VerboseLogging then
+			Log("INFO", string.format(
+				"Iteration #%d | Waiting %.3fs ...",
+				_iterationCount, delay
+			))
+		end
+
+		task.wait(delay)
+
+		-- Guard: pastikan state masih Running setelah wait
+		-- (bisa berubah jika Stop() dipanggil saat menunggu)
+		if _state ~= "Running" then
+			Log("INFO", "State changed during wait, exiting loop")
+			break
+		end
+
+		-- ── Capture snapshot ──
+		local success, snapshot = CaptureSnapshot()
+
+		if success and snapshot then
+			-- Reset error counter pada keberhasilan
+			_consecutiveErrors = 0
+
+			local hasChange = (#snapshot.DeltaAdded > 0) or (#snapshot.DeltaRemoved > 0)
+
+			if hasChange then
+				Log("INFO", string.format(
+					"Δ CHANGE DETECTED | +%d added | -%d removed | Total tracked: %d",
+					#snapshot.DeltaAdded,
+					#snapshot.DeltaRemoved,
+					snapshot.ChildCount
+				))
+
+				-- Log detail objek yang berubah
+				for _, name in snapshot.DeltaAdded do
+					Log("INFO", "  [+] " .. name)
+				end
+				for _, name in snapshot.DeltaRemoved do
+					Log("INFO", "  [-] " .. name)
+				end
+			else
+				if CONFIG.VerboseLogging then
+					Log("INFO", string.format(
+						"No change | Tracked objects: %d",
+						snapshot.ChildCount
+					))
+				end
+			end
+
+			-- Simpan & notify
+			_lastSnapshot = snapshot
+			NotifyListeners(snapshot)
+
+		else
+			-- ── Error path ──
+			_consecutiveErrors += 1
+			Log("ERROR", string.format(
+				"Snapshot capture FAILED (%d/%d)",
+				_consecutiveErrors, CONFIG.MaxRetryOnFail
+			))
+
+			-- Circuit breaker: hentikan jika error berlebihan
+			if _consecutiveErrors >= CONFIG.MaxRetryOnFail then
+				_state = "Error"
+				Log("ERROR", "═══ CIRCUIT BREAKER TRIPPED — Monitor HALTED ═══")
+				break
+			end
+		end
+	end
+
+	Log("INFO", "═══ Monitor loop EXITED | State: " .. _state .. " ═══")
+end
+
+-- ╔══════════════════════════════════════════╗
+-- ║          PUBLIC API FUNCTIONS            ║
+-- ╚══════════════════════════════════════════╝
+
+--- Mulai monitoring secara asinkron (non-blocking).
+--- Menggunakan task.spawn agar TIDAK memblokir thread utama.
+local function StartMonitor(): boolean
+	if _state == "Running" then
+		Log("INFO", "Monitor already running — Start() ignored")
+		return false
+	end
+
+	_state             = "Running"
+	_consecutiveErrors = 0
+	_iterationCount    = 0
+	_lastSnapshot      = nil
+
+	-- Setup event bridge untuk real-time delta hints
+	SetupEventBridge()
+
+	-- Spawn core loop di thread terpisah
+	local spawnOk, spawnErr = pcall(function()
+		_monitorThread = task.spawn(function()
+			-- Wrap seluruh loop dalam pcall sebagai safety net terakhir
+			local loopOk, loopErr = pcall(MonitorLoop)
+			if not loopOk then
+				_state = "Error"
+				Log("ERROR", "Unhandled exception in monitor loop: " .. tostring(loopErr))
+			end
+		end)
+	end)
+
+	if spawnOk then
+		Log("INFO", "Async monitor thread spawned successfully")
+		return true
+	else
+		_state = "Error"
+		Log("ERROR", "Failed to spawn monitor thread: " .. tostring(spawnErr))
+		return false
+	end
+end
+
+--- Hentikan monitoring secara graceful.
+--- Thread akan exit natural di task.wait() berikutnya.
+local function StopMonitor()
+	if _state ~= "Running" then
+		Log("INFO", "Monitor not running — Stop() ignored")
+		return
+	end
+
+	_state = "Stopped"
+	TeardownEventBridge()
+	Log("INFO", "Stop signal sent — thread will exit after current wait")
+end
+
+--- Full cleanup: hentikan, putus connection, bersihkan memori.
+local function DestroyMonitor()
+	StopMonitor()
+	_listeners    = {}
+	_lastSnapshot = nil
+	_monitorThread = nil
+	Log("INFO", "Monitor destroyed — all references cleared")
+end
+
+--- Ambil snapshot terakhir tanpa menunggu iterasi berikutnya.
+local function GetLastSnapshot(): WorkspaceSnapshot?
+	return _lastSnapshot
+end
+
+--- Dapatkan state monitor saat ini.
+local function GetMonitorState(): MonitorState
+	return _state
+end
+
+-- ╔══════════════════════════════════════════╗
+-- ║          EXECUTION — CLIENT SIDE         ║
+-- ╚══════════════════════════════════════════╝
+-- Semua logika dieksekusi langsung di sini.
+-- Tidak ada Server Script, tidak ada RemoteEvent,
+-- tidak ada require() ke modul eksternal.
+
+Log("INFO", "══════════════════════════════════════════")
+Log("INFO", " AsyncWorkspaceMonitor — Initializing")
+Log("INFO", " Execution context: CLIENT")
+Log("INFO", "══════════════════════════════════════════")
+
+-- Validasi config sebelum mulai
+local configOk, configErr = pcall(function()
+	assert(CONFIG.MinInterval > 0, "MinInterval harus > 0")
+	assert(CONFIG.MaxInterval >= CONFIG.MinInterval, "MaxInterval harus >= MinInterval")
+	assert(CONFIG.MaxRetryOnFail > 0, "MaxRetryOnFail harus > 0")
 end)
 
--- Weather Monitor Loop
-task.spawn(function()
-    while true do
-        pcall(function()
-            local weather = getWeather()
-            local etype = checkElemental(weather)
-            
-            if etype then
-                if etype ~= getgenv().lastElemental and getgenv().NotifyElemental then
-                    getgenv().lastElemental = etype
-                    local emoji = etype == "fire" and "🔥" or etype == "thunder" and "⚡" or "❄️"
-                    local title = emoji .. " " .. etype:upper() .. " WEATHER DETECTED!"
-                    local desc = string.format("**Player:** %s\n**Weather:** %s\n**Element:** %s\n**Location:** Elemental Island", Player.Name, weather, etype:upper())
-                    local color = etype == "fire" and 15158332 or etype == "thunder" and 16766720 or 65280
-                    
-                    sendDiscord(title, desc, color)
-                    
-                    Fluent:Notify({
-                        Title = title,
-                        Content = weather,
-                        Duration = 5
-                    })
-                end
-            else
-                getgenv().lastElemental = ""
-                
-                if getgenv().NotifyNormal and weather ~= getgenv().lastWeather then
-                    sendDiscord("🌤️ Weather Changed", "**Weather:** " .. weather, 5814783)
-                end
-            end
-            
-            getgenv().lastWeather = weather
-        end)
-        wait(getgenv().CheckInterval or 5)
-    end
+if not configOk then
+	Log("ERROR", "Config validation failed: " .. tostring(configErr))
+	return
+end
+
+-- ── Daftarkan listener contoh (demo) ──
+local unsubscribeDemo = OnSnapshot(function(snapshot: WorkspaceSnapshot)
+	-- Listener ini berjalan setiap snapshot berhasil diambil.
+	-- Bisa diganti dengan logic game-specific.
+
+	if #snapshot.DeltaAdded > 0 then
+		-- Contoh: print objek baru yang muncul di Workspace
+		for _, name in snapshot.DeltaAdded do
+			print("[Demo Listener] Objek baru terdeteksi:", name)
+		end
+	end
+
+	if #snapshot.DeltaRemoved > 0 then
+		for _, name in snapshot.DeltaRemoved do
+			print("[Demo Listener] Objek dihapus:", name)
+		end
+	end
 end)
 
--- Anti AFK
-task.spawn(function()
-    while true do
-        pcall(function()
-            if getgenv().AntiAFK then
-                VirtualUser:Button2Down(Vector2.new(0,0), Workspace.CurrentCamera.CFrame)
-                wait(1)
-                VirtualUser:Button2Up(Vector2.new(0,0), Workspace.CurrentCamera.CFrame)
-            end
-        end)
-        wait(180)
-    end
-end)
+-- ── Mulai monitoring ──
+local started = StartMonitor()
+
+if started then
+	Log("INFO", "Monitor aktif. Tekan tombol 'M' untuk toggle stop/start (demo).")
+
+	-- ── Demo: Keyboard toggle (opsional, hapus jika tidak perlu) ──
+	local UserInputService = game:GetService("UserInputService")
+
+	local inputOk, inputErr = pcall(function()
+		UserInputService.InputBegan:Connect(function(input, gameProcessed)
+			if gameProcessed then return end
+
+			if input.KeyCode == Enum.KeyCode.M then
+				if GetMonitorState() == "Running" then
+					Log("INFO", "[KEY M] Stopping monitor...")
+					StopMonitor()
+				else
+					Log("INFO", "[KEY M] Restarting monitor...")
+					StartMonitor()
+				end
+			end
+		end)
+	end)
+
+	if not inputOk then
+		Log("ERROR", "Keyboard listener setup failed: " .. tostring(inputErr))
+	end
+
+else
+	Log("ERROR", "Monitor failed to start. Check Output for details.")
+end
+
+-- ╔══════════════════════════════════════════╗
+-- ║          CLEANUP ON PLAYER LEAVING       ║
+-- ╚══════════════════════════════════════════╝
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+if LocalPlayer then
+	local cleanupOk, cleanupErr = pcall(function()
+		Players.PlayerRemoving:Connect(function(player)
+			if player == LocalPlayer then
+				DestroyMonitor()
+			end
+		end)
+	end)
+
+	if not cleanupOk then
+		Log("ERROR", "Cleanup handler failed: " .. tostring(cleanupErr))
+	end
+
+	-- Fallback cleanup saat LocalScript di-destroy
+	script.Destroying:Connect(function()
+		DestroyMonitor()
+	end)
+end
+
+Log("INFO", "══════════════════════════════════════════")
+Log("INFO", " AsyncWorkspaceMonitor — READY")
+Log("INFO", "══════════════════════════════════════════")
