@@ -190,12 +190,13 @@ function heartWithTextPoints(n, lines) {
   octx.closePath();
   octx.stroke();
 
-  // tulisan di tengah bentuk hati
-  octx.font = "bold 54px 'Courier New', monospace";
+  // tulisan di bagian "perut" hati yang paling lebar, biar gak numpuk/kepotong
+  octx.font = "bold 40px 'Courier New', monospace";
   octx.textAlign = 'center';
   octx.textBaseline = 'middle';
+  const lineY = [cy + topH + 55, cy + topH + 113];
   lines.forEach((line, idx) => {
-    octx.fillText(line, cx, cy + topH + 95 + idx * 62);
+    octx.fillText(line, cx, lineY[idx]);
   });
 
   const data = octx.getImageData(0, 0, off.width, off.height).data;
