@@ -79,7 +79,10 @@
   <div id="hint">
     ✋ Telapak terbuka → partikel bebas<br>
     ✊ Kepalan tangan → bentuk hati<br>
-    🤟 Sign "I Love You" → tulisan
+    🤟 Sign "I Love You" → tulisan<br>
+    ✌️ Peace → bintang<br>
+    👍 Jempol → tulisan "mantap"<br>
+    ☝️ Telunjuk → spiral
   </div>
 
   <div id="cam-box">
@@ -105,9 +108,12 @@ window.addEventListener('resize', resize);
 
 /* ================= GESTURE STATE ================= */
 const GESTURES = {
-  SCATTER: { label: 'OPEN PALM', color: [79, 216, 196] },   // teal
-  HEART:   { label: 'FIST · HEART', color: [255, 70, 70] }, // red
-  TEXT:    { label: 'I LOVE YOU', color: [90, 240, 170] },  // green-teal
+  SCATTER:    { label: 'OPEN PALM', color: [79, 216, 196] },    // teal
+  HEART:      { label: 'FIST · HEART', color: [255, 70, 70] },  // red
+  TEXT:       { label: 'I LOVE YOU', color: [90, 240, 170] },   // green-teal
+  STAR:       { label: 'PEACE · BINTANG', color: [255, 210, 90] },  // gold
+  THUMBS_UP:  { label: 'JEMPOL · MANTAP', color: [255, 150, 70] },  // orange
+  POINT:      { label: 'TUNJUK · SPIRAL', color: [120, 160, 255] }, // blue
 };
 let currentGesture = 'SCATTER';
 let handCenter = { x: 0.5, y: 0.5 }; // normalized, smoothed
@@ -174,11 +180,56 @@ function scatterPoints(n) {
   return pts;
 }
 
+function starPoints(n) {
+  const spikes = 5, outerR = 1.15, innerR = 0.48;
+  const verts = [];
+  for (let i = 0; i < spikes * 2; i++) {
+    const r = i % 2 === 0 ? outerR : innerR;
+    const ang = -Math.PI / 2 + (i * Math.PI) / spikes;
+    verts.push({ x: Math.cos(ang) * r, y: Math.sin(ang) * r });
+  }
+  function inside(px, py) {
+    let c = false;
+    for (let i = 0, j = verts.length - 1; i < verts.length; j = i++) {
+      const xi = verts[i].x, yi = verts[i].y, xj = verts[j].x, yj = verts[j].y;
+      const hit = (yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi;
+      if (hit) c = !c;
+    }
+    return c;
+  }
+  const pts = [];
+  let tries = 0;
+  while (pts.length < n && tries < n * 60) {
+    tries++;
+    const x = (Math.random() * 2 - 1) * 1.2;
+    const y = (Math.random() * 2 - 1) * 1.2;
+    if (inside(x, y)) pts.push({ x, y });
+  }
+  while (pts.length < n) pts.push(pts[Math.floor(Math.random() * pts.length)] || { x: 0, y: 0 });
+  return pts;
+}
+
+function spiralPoints(n) {
+  const pts = [];
+  const turns = 3.2;
+  for (let i = 0; i < n; i++) {
+    const t = i / n;
+    const ang = t * Math.PI * 2 * turns;
+    const r = t * 1.15;
+    const jitter = (Math.random() - 0.5) * 0.06;
+    pts.push({ x: Math.cos(ang) * (r + jitter), y: Math.sin(ang) * (r + jitter) });
+  }
+  return pts;
+}
+
 const N = 1800;
 const shapeCache = {
   SCATTER: scatterPoints(N),
   HEART: heartPoints(N),
   TEXT: textPoints(N, 'I LOVE YOU'),
+  STAR: starPoints(N),
+  THUMBS_UP: textPoints(N, 'MANTAP!'),
+  POINT: spiralPoints(N),
 };
 
 /* ================= PARTICLES ================= */
@@ -213,7 +264,7 @@ function targetFor(gesture, i, t) {
     const p = shapeCache.HEART[i];
     return { x: cx + p.x * scaleBase, y: cy + p.y * scaleBase };
   }
-  const p = shapeCache.TEXT[i];
+  const p = shapeCache[gesture][i];
   return { x: cx + p.x * scaleBase, y: cy + p.y * scaleBase };
 }
 
@@ -278,10 +329,13 @@ function detectGesture(landmarks) {
   const pinky = fingerExtended(landmarks, 20, 18);
   const extendedCount = [thumb, index, middle, ring, pinky].filter(Boolean).length;
 
-  if (thumb && index && pinky && !middle && !ring) return 'TEXT';   // I love you sign
-  if (extendedCount <= 1) return 'HEART';                            // fist
-  if (extendedCount >= 4) return 'SCATTER';                          // open palm
-  return currentGesture; // ambiguous, keep previous state (smooth)
+  if (thumb && index && pinky && !middle && !ring) return 'TEXT';       // I love you sign
+  if (index && middle && !ring && !pinky && !thumb) return 'STAR';      // peace / victory
+  if (thumb && !index && !middle && !ring && !pinky) return 'THUMBS_UP'; // jempol doang
+  if (index && !middle && !ring && !pinky && !thumb) return 'POINT';    // telunjuk doang
+  if (extendedCount === 0) return 'HEART';                              // kepalan penuh
+  if (extendedCount >= 4) return 'SCATTER';                             // telapak terbuka
+  return currentGesture; // ambigu, pertahankan state sebelumnya
 }
 
 function onResults(results) {
