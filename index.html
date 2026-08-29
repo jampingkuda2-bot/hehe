@@ -176,10 +176,10 @@ function heartWithTextPoints(n, lines) {
   const octx = off.getContext('2d');
   octx.strokeStyle = '#fff';
   octx.fillStyle = '#fff';
-  octx.lineWidth = 16;
+  octx.lineWidth = 14;
 
   // garis luar bentuk hati (outline, bukan penuh, biar tulisan di dalam kebaca)
-  const cx = 450, cy = 220, size = 480;
+  const cx = 450, cy = 210, size = 520;
   const topH = size * 0.3;
   octx.beginPath();
   octx.moveTo(cx, cy + topH);
@@ -190,19 +190,19 @@ function heartWithTextPoints(n, lines) {
   octx.closePath();
   octx.stroke();
 
-  // tulisan di bagian "perut" hati yang paling lebar, dibesarin biar jelas kebaca
-  octx.font = "bold 58px 'Courier New', monospace";
+  // tulisan tebal & besar di bagian "perut" hati yang paling lebar
+  octx.font = "900 66px Arial, sans-serif";
   octx.textAlign = 'center';
   octx.textBaseline = 'middle';
-  const lineY = [cy + topH + 65, cy + topH + 138];
+  const lineY = [cy + topH + 70, cy + topH + 150];
   lines.forEach((line, idx) => {
     octx.fillText(line, cx, lineY[idx]);
   });
 
   const data = octx.getImageData(0, 0, off.width, off.height).data;
   const candidates = [];
-  for (let y = 0; y < off.height; y += 3) {
-    for (let x = 0; x < off.width; x += 3) {
+  for (let y = 0; y < off.height; y += 2) {
+    for (let x = 0; x < off.width; x += 2) {
       const a = data[(y * off.width + x) * 4 + 3];
       if (a > 128) {
         candidates.push({
@@ -295,7 +295,7 @@ for (let i = 0; i < N; i++) {
   });
 }
 
-const GESTURE_SCALE = { HEART: 1, TEXT: 1.7, STAR: 1, THUMBS_UP: 1.15, POINT: 1 };
+const GESTURE_SCALE = { HEART: 1, TEXT: 1.85, STAR: 1, THUMBS_UP: 1.15, POINT: 1 };
 // seberapa besar tiap bentuk ikut geser mengikuti posisi tangan (0 = diam di tengah, 1 = full ikut tangan)
 const FOLLOW_WEIGHT = { SCATTER: 1, HEART: 0.5, TEXT: 0.28, STAR: 0.5, THUMBS_UP: 0.45, POINT: 0.55 };
 
